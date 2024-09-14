@@ -78,9 +78,8 @@ def main():
             chat_ids = [chat_row[0] for chat_row in chats_to_delete]
             logger.info("Found %d chats with IDs: %s", len(chat_ids), chat_ids)
 
-            # For each chat, parse the 'chat' JSON to find associated files
+            # For each chat, parse the 'chat' JSON to find associated file IDs
             file_ids_to_delete = set()
-            file_paths_to_delete = set()
 
             for chat_id, chat_json in chats_to_delete:
                 try:
@@ -95,27 +94,35 @@ def main():
                     for file_entry in files:
                         file_info = file_entry.get('file', {})
                         file_id = file_info.get('id')
-                        filename = file_info.get('filename')
-                        file_meta = file_info.get('meta', {})
-                        file_path = file_meta.get('path')
-
                         if file_id:
                             file_ids_to_delete.add(file_id)
-                        if file_path:
-                            file_paths_to_delete.add(file_path)
-                        elif filename:
-                            # Construct file path if 'path' is not available
-                            file_paths_to_delete.add(os.path.join(uploads_dir, filename))
+
+            # Now, get filenames from 'file' table for these file_ids
+            file_paths_to_delete = set()
+
+            if file_ids_to_delete:
+                placeholders = ','.join(['?'] * len(file_ids_to_delete))
+                try:
+                    cursor.execute(f"SELECT id, filename FROM file WHERE id IN ({placeholders})", list(file_ids_to_delete))
+                    file_rows = cursor.fetchall()
+                except sqlite3.Error as e:
+                    logger.error("Failed to retrieve filenames from 'file' table: %s", e)
+                    conn.close()
+                    return
+
+                for file_id, filename in file_rows:
+                    file_path = os.path.join(uploads_dir, filename)
+                    file_paths_to_delete.add(file_path)
 
             if TEST == 'N':
                 logger.info("Deleting %d file records from 'file' table", len(file_ids_to_delete))
                 # Delete file records from 'file' table
-                for file_id in file_ids_to_delete:
-                    try:
-                        cursor.execute("DELETE FROM file WHERE id = ?", (file_id,))
-                    except sqlite3.Error as e:
-                        logger.error("Failed to delete file record with ID %s: %s", file_id, e)
-                        continue  # Continue deleting other file records
+                placeholders = ','.join(['?'] * len(file_ids_to_delete))
+                try:
+                    cursor.execute(f"DELETE FROM file WHERE id IN ({placeholders})", list(file_ids_to_delete))
+                except sqlite3.Error as e:
+                    logger.error("Failed to delete file records: %s", e)
+                    # Do not rollback yet; continue to try to delete chats
             else:
                 logger.info("Would delete %d file records from 'file' table", len(file_ids_to_delete))
                 for file_id in file_ids_to_delete:
@@ -144,9 +151,8 @@ def main():
             # Delete chats from database
             if TEST == 'N':
                 try:
-                    cursor.execute("DELETE FROM chat WHERE id IN ({seq})".format(
-                        seq=','.join(['?']*len(chat_ids))
-                    ), chat_ids)
+                    placeholders = ','.join(['?'] * len(chat_ids))
+                    cursor.execute(f"DELETE FROM chat WHERE id IN ({placeholders})", chat_ids)
                     logger.info("Deleted %d chats from the database.", cursor.rowcount)
                 except sqlite3.Error as e:
                     logger.error("Failed to delete chats: %s", e)
