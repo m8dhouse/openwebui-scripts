@@ -14,7 +14,7 @@ Cleans chat and file table for chats older than 30 days (checked on update date)
 Removes the files also from the folder.
 
 Adapt paths to your situation and days to delete.
-
+```
 ```bash
 python3 cleanup.py --test N
 ```
