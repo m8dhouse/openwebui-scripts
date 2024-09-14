@@ -54,86 +54,13 @@ def main(test_mode):
         conn.execute('BEGIN')
 
         # Check if required tables exist
-        required_tables = ['chat', 'file', 'document']
+        required_tables = ['file', 'document']
         for table in required_tables:
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
             if not cursor.fetchone():
                 logger.error("Table '%s' does not exist in the database", table)
                 conn.close()
                 return
-
-        # Collect all file IDs referenced in chats
-        cursor.execute("SELECT chat FROM chat")
-        chats = cursor.fetchall()
-        file_ids_in_chats = set()
-
-        for (chat_json,) in chats:
-            try:
-                chat_data = json.loads(chat_json)
-                messages = chat_data.get('messages', [])
-                for message in messages:
-                    files = message.get('files', [])
-                    for file_entry in files:
-                        file_info = file_entry.get('file', {})
-                        file_id = file_info.get('id')
-                        if file_id:
-                            file_ids_in_chats.add(file_id)
-            except json.JSONDecodeError as e:
-                logger.error("Failed to parse chat JSON: %s", e)
-                continue
-
-        logger.info("Total file IDs referenced in chats: %d", len(file_ids_in_chats))
-
-        # Collect all file IDs from the 'file' table
-        cursor.execute("SELECT id, filename FROM file")
-        files_in_table = cursor.fetchall()
-        file_ids_in_table = set()
-        file_id_to_filename = {}
-
-        for file_id, filename in files_in_table:
-            file_ids_in_table.add(file_id)
-            file_id_to_filename[file_id] = filename
-
-        logger.info("Total file IDs in 'file' table: %d", len(file_ids_in_table))
-
-        # Identify orphaned files in 'file' table (not referenced in chats)
-        orphan_file_ids = file_ids_in_table - file_ids_in_chats
-        logger.info("Orphaned file IDs in 'file' table: %d", len(orphan_file_ids))
-
-        # Delete orphaned file records and files
-        if orphan_file_ids:
-            logger.info("Processing orphaned files in 'file' table...")
-
-            for file_id in orphan_file_ids:
-                try:
-                    filename = file_id_to_filename.get(file_id)
-                    file_path = os.path.join(uploads_dir, filename) if filename else None
-
-                    # Log the reasoning for deletion
-                    logger.info("File ID %s (%s) is not referenced in any chats and will be considered for deletion.", file_id, filename)
-
-                    if not test_mode:
-                        # Delete the file record from 'file' table
-                        try:
-                            cursor.execute("DELETE FROM file WHERE id = ?", (file_id,))
-                            logger.info("Deleted file record with ID %s from 'file' table.", file_id)
-                        except sqlite3.Error as e:
-                            logger.error("Failed to delete file record with ID %s: %s", file_id, e)
-                    else:
-                        logger.info("Test mode: Would delete file record with ID %s", file_id)
-
-                    # Delete the physical file (using delete_file function)
-                    if file_path:
-                        delete_file(file_path, test_mode)
-                    else:
-                        logger.warning("No filename found for file ID %s.", file_id)
-
-                except Exception as e:
-                    logger.error("Unexpected error processing file ID %s: %s", file_id, e)
-                    # Continue processing the next file
-
-        # Now check for orphaned files in uploads directory
-        logger.info("Checking for orphaned files in uploads directory...")
 
         # Get all filenames from 'file' and 'document' tables and normalize them
         cursor.execute("SELECT filename FROM file")
@@ -152,32 +79,27 @@ def main(test_mode):
 
         # List all files in the uploads directory and normalize them
         try:
-            files_in_uploads = {normalize_filename(f) for f in os.listdir(uploads_dir)}
+            original_files_in_uploads = os.listdir(uploads_dir)
+            files_in_uploads = {normalize_filename(f): f for f in original_files_in_uploads}
         except Exception as e:
             logger.error("Error listing files in uploads directory: %s", e)
-            files_in_uploads = set()
+            files_in_uploads = {}
 
         logger.info("Total files in uploads directory: %d", len(files_in_uploads))
         logger.debug("Files in uploads directory: %s", files_in_uploads)
 
         # Identify orphaned files in uploads directory
-        orphan_files_in_uploads = files_in_uploads - referenced_filenames
+        orphan_files_in_uploads = set(files_in_uploads.keys()) - referenced_filenames
         logger.info("Orphaned files in uploads directory: %d", len(orphan_files_in_uploads))
         logger.debug("Orphaned files: %s", orphan_files_in_uploads)
 
         if orphan_files_in_uploads:
             logger.info("Processing orphaned files in uploads directory...")
 
-            for filename in orphan_files_in_uploads:
+            for normalized_filename in orphan_files_in_uploads:
                 try:
-                    # Find the original filename (without normalization) to construct the file path
-                    matching_files = [f for f in os.listdir(uploads_dir) if normalize_filename(f) == filename]
-                    if matching_files:
-                        original_filename = matching_files[0]
-                        file_path = os.path.join(uploads_dir, original_filename)
-                    else:
-                        file_path = os.path.join(uploads_dir, filename)  # Fallback in case of mismatch
-                        original_filename = filename
+                    original_filename = files_in_uploads[normalized_filename]
+                    file_path = os.path.join(uploads_dir, original_filename)
 
                     # Log the reasoning for deletion
                     logger.info("File '%s' is not referenced in the 'file' or 'document' tables and will be considered for deletion.", original_filename)
@@ -186,7 +108,7 @@ def main(test_mode):
                     delete_file(file_path, test_mode)
 
                 except Exception as e:
-                    logger.error("Unexpected error processing file %s: %s", filename, e)
+                    logger.error("Unexpected error processing file %s: %s", normalized_filename, e)
                     # Continue processing the next file
 
         # Commit or rollback the transaction
@@ -216,7 +138,7 @@ if __name__ == "__main__":
     logger.addHandler(handler)
 
     # Parse command-line arguments
-    parser = argparse.ArgumentParser(description='Cleanup orphaned files and records.')
+    parser = argparse.ArgumentParser(description='Cleanup orphaned files.')
     parser.add_argument('--test', choices=['Y', 'N'], default='Y', help='Test mode (Y/N). Default is Y.')
     args = parser.parse_args()
 
