@@ -9,7 +9,7 @@ import argparse
 # Configuration variables
 db_path = "/usr/openweb/venv/lib/python3.11/site-packages/open_webui/data/webui.db"
 uploads_dir = "/usr/openweb/venv/lib/python3.11/site-packages/open_webui/data/uploads/"
-cleanup_days = 1  # Number of days after which chats and files will be deleted
+cleanup_days = 30  # Number of days after which chats and files will be deleted
 log_file = '/usr/openweb/cleanlog/cleanup_openui.log'  # Update this path to the desired log file location
 
 def is_unix_timestamp(s):
