@@ -65,7 +65,7 @@ def main():
 
         # Select chat IDs and 'chat' JSON to delete
         try:
-            cursor.execute("SELECT id, chat FROM chat WHERE updated_at < ?", (cleanup_threshold,))
+            cursor.execute("SELECT id, chat FROM chat WHERE updated_at < ? AND archived != 1", (cleanup_threshold,))
             chats_to_delete = cursor.fetchall()
         except sqlite3.Error as e:
             logger.error("Failed to execute SELECT query: %s", e)
