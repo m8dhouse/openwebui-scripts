@@ -148,7 +148,15 @@ def get_db_session():
         raise
 
 def extract_file_ids_from_chat(chat_data: Dict[str, Any]) -> Set[str]:
-    """Extract file IDs from chat messages."""
+    """
+    Extract file IDs from chat messages.
+    
+    Args:
+        chat_data: Chat data dictionary
+        
+    Returns:
+        Set of file IDs
+    """
     file_ids = set()
     
     # Check if chat has messages
@@ -175,67 +183,45 @@ def extract_file_ids_from_chat(chat_data: Dict[str, Any]) -> Set[str]:
                 
     return file_ids
 
-def get_old_chat_ids(days_threshold: int, session) -> List[str]:
+def get_old_chat_ids(session, days: int) -> Generator[str, None, None]:
     """
-    Get IDs of chats older than the specified number of days.
-    This is more memory-efficient than loading the entire chat objects.
+    Get chat IDs older than specified days.
     
     Args:
-        days_threshold: Number of days after which chats should be deleted
-        session: Database session
+        session: SQLAlchemy session
+        days: Number of days to look back
         
     Returns:
-        List of chat IDs
+        Generator of chat IDs
     """
-    # Calculate timestamp threshold
-    current_time = int(time.time())
-    threshold_time = current_time - (days_threshold * 24 * 60 * 60)
-    
-    log.info(f"Getting IDs of chats older than {days_threshold} days (before {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(threshold_time))})")
-    
-    # Query for chat IDs only
-    chat_ids = []
-    batch_size = 1000
-    offset = 0
-    
-    # Check if archived column exists
-    has_archived = False
     try:
-        result = session.execute(text(f"SELECT column_name FROM information_schema.columns WHERE table_name = '{Chat.__tablename__}' AND column_name = 'archived'"))
-        has_archived = result.fetchone() is not None
-    except Exception as e:
-        log.warning(f"Error checking for archived column: {e}")
-    
-    while True:
-        try:
-            # Use a raw SQL query to get just the IDs
-            if has_archived:
-                # Exclude archived chats
-                result = session.execute(
-                    text(f"SELECT id FROM {Chat.__tablename__} WHERE updated_at < :threshold AND (archived IS NULL OR archived = FALSE) ORDER BY id LIMIT :limit OFFSET :offset"),
-                    {"threshold": threshold_time, "limit": batch_size, "offset": offset}
-                )
-            else:
-                # No archived column, get all old chats
-                result = session.execute(
-                    text(f"SELECT id FROM {Chat.__tablename__} WHERE updated_at < :threshold ORDER BY id LIMIT :limit OFFSET :offset"),
-                    {"threshold": threshold_time, "limit": batch_size, "offset": offset}
-                )
+        # Check if archived column exists
+        table_names = inspect(session.get_bind()).get_table_names()
+        if Chat.__tablename__ in table_names:
+            columns = inspect(session.get_bind()).get_columns(Chat.__tablename__)
+            has_archived = any(col['name'] == 'archived' for col in columns)
             
-            batch = [row[0] for row in result]
-            if not batch:
-                break
-                
-            chat_ids.extend(batch)
-            log.info(f"Found {len(chat_ids)} old chat IDs so far...")
-            offset += batch_size
-        except Exception as e:
-            log.error(f"Error querying old chat IDs: {e}")
-            log.error(traceback.format_exc())
-            break
-    
-    log.info(f"Found {len(chat_ids)} chat IDs older than {days_threshold} days")
-    return chat_ids
+            # Calculate cutoff timestamp
+            cutoff = int((datetime.now() - timedelta(days=days)).timestamp())
+            
+            # Build query based on whether archived column exists
+            if has_archived:
+                query = text(f"""
+                    SELECT id FROM {Chat.__tablename__}
+                    WHERE created_at < :cutoff AND (archived IS NULL OR archived = false)
+                """)
+            else:
+                query = text(f"""
+                    SELECT id FROM {Chat.__tablename__}
+                    WHERE created_at < :cutoff
+                """)
+            
+            result = session.execute(query, {"cutoff": cutoff})
+            for row in result:
+                yield row[0]
+    except Exception as e:
+        log.error(f"Error getting old chat IDs: {e}")
+        log.error(traceback.format_exc())
 
 def get_chat_by_id(session, chat_id: str) -> Optional[Chat]:
     """Get a chat by ID."""
@@ -329,8 +315,8 @@ def find_old_chats_and_files(days_threshold: int = 45) -> Tuple[List[str], Set[s
             log.error(f"Error getting chat timestamps: {e}")
             log.error(traceback.format_exc())
         
-        # Get old chat IDs
-        old_chat_ids = get_old_chat_ids(days_threshold, session)
+        # Get old chat IDs and convert generator to list
+        old_chat_ids = list(get_old_chat_ids(session, days_threshold))
         
         if not old_chat_ids:
             log.info("No old chats found to clean up")
@@ -348,54 +334,54 @@ def find_old_chats_and_files(days_threshold: int = 45) -> Tuple[List[str], Set[s
         if session:
             session.close()
 
-def delete_file(file_id: str, session, dry_run: bool = True) -> bool:
+def delete_file(session, file_id: str, dry_run: bool = True) -> bool:
     """
     Delete a file from the database and filesystem.
     
     Args:
+        session: SQLAlchemy session
         file_id: ID of the file to delete
-        session: Database session
-        dry_run: If True, only log what would be deleted without actually deleting
+        dry_run: If True, only log what would be deleted
         
     Returns:
-        True if the file was deleted or would be deleted in dry run mode, False otherwise
+        True if file was deleted or would be deleted in dry run mode
     """
     try:
-        # Get the file from the database
-        file = session.query(File).filter(File.id == file_id).first()
-        if not file:
-            log.warning(f"File {file_id} not found in database, skipping deletion")
+        # Get file record
+        result = session.execute(
+            text(f"SELECT filename, path FROM {File.__tablename__} WHERE id = :file_id"),
+            {"file_id": file_id}
+        )
+        file_record = result.fetchone()
+        
+        if not file_record:
+            log.warning(f"File {file_id} not found in database")
             return True  # Return True to continue processing
             
-        # Get the file path
-        file_path = os.path.join(uploads_dir, file.filename)
+        filename, path = file_record
         
-        # Delete the physical file
-        if not dry_run:
+        # Delete file from filesystem if it exists
+        if path:
+            file_path = os.path.join(uploads_dir, path)
             if os.path.exists(file_path):
-                try:
+                if not dry_run:
                     os.remove(file_path)
-                    log.info(f"Deleted file {file_path}")
-                except Exception as e:
-                    log.error(f"Error deleting file {file_path}: {e}")
-                    log.error(traceback.format_exc())
-                    return False
+                    log.info(f"Deleted file: {file_path}")
+                else:
+                    log.info(f"Would delete file: {file_path}")
             else:
-                log.warning(f"File {file_path} does not exist, skipping deletion")
+                log.warning(f"File not found at path: {file_path}")
         
-        # Delete the database record
+        # Delete file record from database
         if not dry_run:
-            try:
-                session.delete(file)
-                session.commit()
-                log.info(f"Deleted file record {file_id} from database")
-            except Exception as e:
-                log.error(f"Error deleting file record {file_id} from database: {e}")
-                log.error(traceback.format_exc())
-                session.rollback()
-                return False
+            session.execute(
+                text(f"DELETE FROM {File.__tablename__} WHERE id = :file_id"),
+                {"file_id": file_id}
+            )
+            session.commit()
+            log.info(f"Deleted file record from database: {filename}")
         else:
-            log.info(f"DRY RUN: Would delete file {file_path} and database record {file_id}")
+            log.info(f"Would delete file record from database: {filename}")
         
         return True
     except Exception as e:
@@ -403,21 +389,54 @@ def delete_file(file_id: str, session, dry_run: bool = True) -> bool:
         log.error(traceback.format_exc())
         return False
 
-def delete_chat(session, chat_id: str) -> bool:
-    """Delete a chat by ID."""
+def delete_chat(session, chat_id: str, dry_run: bool = True) -> bool:
+    """
+    Delete a chat and its associated files.
+    
+    Args:
+        session: SQLAlchemy session
+        chat_id: ID of the chat to delete
+        dry_run: If True, only log what would be deleted
+        
+    Returns:
+        True if chat was deleted or would be deleted in dry run mode
+    """
     try:
-        chat = session.query(Chat).filter_by(id=chat_id).first()
-        if chat:
-            session.delete(chat)
+        # Get chat data
+        result = session.execute(
+            text(f"SELECT chat FROM {Chat.__tablename__} WHERE id = :chat_id"),
+            {"chat_id": chat_id}
+        )
+        chat_record = result.fetchone()
+        
+        if not chat_record:
+            log.warning(f"Chat {chat_id} not found in database")
+            return True  # Return True to continue processing
+            
+        chat_data = chat_record[0]
+        
+        # Extract file IDs from chat
+        file_ids = extract_file_ids_from_chat(chat_data)
+        
+        # Delete associated files
+        for file_id in file_ids:
+            delete_file(session, file_id, dry_run)
+        
+        # Delete chat record
+        if not dry_run:
+            session.execute(
+                text(f"DELETE FROM {Chat.__tablename__} WHERE id = :chat_id"),
+                {"chat_id": chat_id}
+            )
             session.commit()
-            log.info(f"Deleted chat {chat_id} from database")
-            return True
-        log.warning(f"Chat {chat_id} not found in database, skipping deletion")
-        return False
+            log.info(f"Deleted chat: {chat_id}")
+        else:
+            log.info(f"Would delete chat: {chat_id}")
+        
+        return True
     except Exception as e:
         log.error(f"Error deleting chat {chat_id}: {e}")
         log.error(traceback.format_exc())
-        session.rollback()
         return False
 
 def compact_postgresql(dry_run: bool = False) -> None:
@@ -613,7 +632,7 @@ def cleanup_old_chats(days_threshold: int = 45, dry_run: bool = False) -> None:
                 for file_id in batch:
                     try:
                         # Delete file
-                        if delete_file(file_id, session, dry_run):
+                        if delete_file(session, file_id, dry_run):
                             deleted_files += 1
                     except Exception as e:
                         log.error(f"Error deleting file {file_id}: {e}")
@@ -637,7 +656,7 @@ def cleanup_old_chats(days_threshold: int = 45, dry_run: bool = False) -> None:
                             skipped_chats += 1
                             continue
                             
-                        if delete_chat(session, chat_id):
+                        if delete_chat(session, chat_id, dry_run):
                             deleted_chats += 1
                     except Exception as e:
                         log.error(f"Error deleting chat {chat_id}: {e}")
