@@ -10,10 +10,16 @@ import sys
 import re
 from logging.handlers import TimedRotatingFileHandler
 from typing import Set, Dict, List, Optional, Any
+from datetime import datetime
 
 # SQLAlchemy imports
-from sqlalchemy import create_engine, text, Column, Integer, String, DateTime, JSON, ForeignKey, inspect
-from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+from sqlalchemy import Column, String, Integer, BigInteger, Text, JSON, inspect, text
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy import create_engine
+
+from open_webui.models.files import File as FileModel
+from open_webui.models.knowledge import Knowledge as KnowledgeModel
 
 # Configuration variables
 # Update the uploads directory path to match your environment
@@ -276,14 +282,14 @@ def get_referenced_filenames(session) -> Set[str]:
     try:
         # Get filenames from file table
         try:
-            result = session.execute(text(f"SELECT filename FROM {File.__tablename__}"))
+            result = session.execute(text(f"SELECT filename FROM {FileModel.__tablename__}"))
             filenames_in_file_table = {
                 normalize_filename(row[0]) for row in result if row[0]
             }
             referenced_filenames.update(filenames_in_file_table)
-            log.info(f"Found {len(filenames_in_file_table)} filenames in {File.__tablename__} table")
+            log.info(f"Found {len(filenames_in_file_table)} filenames in {FileModel.__tablename__} table")
         except Exception as e:
-            log.error(f"Error getting filenames from {File.__tablename__} table: {e}")
+            log.error(f"Error getting filenames from {FileModel.__tablename__} table: {e}")
             log.error(traceback.format_exc())
         
         # Get filenames from document table if it exists
@@ -330,7 +336,7 @@ def get_referenced_filenames(session) -> Set[str]:
                             # Create placeholders with named parameters
                             placeholders = ','.join([f':id_{j}' for j in range(len(batch))])
                             result = session.execute(
-                                text(f"SELECT filename FROM {File.__tablename__} WHERE id IN ({placeholders})"),
+                                text(f"SELECT filename FROM {FileModel.__tablename__} WHERE id IN ({placeholders})"),
                                 params
                             )
                             filenames_in_knowledge = {
@@ -387,7 +393,7 @@ def get_referenced_filenames(session) -> Set[str]:
                             # Create placeholders with named parameters
                             placeholders = ','.join([f':id_{j}' for j in range(len(batch))])
                             result = session.execute(
-                                text(f"SELECT filename FROM {File.__tablename__} WHERE id IN ({placeholders})"),
+                                text(f"SELECT filename FROM {FileModel.__tablename__} WHERE id IN ({placeholders})"),
                                 params
                             )
                             filenames_in_chats = {
