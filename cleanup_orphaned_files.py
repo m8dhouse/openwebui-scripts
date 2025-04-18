@@ -301,6 +301,51 @@ def get_referenced_filenames(session) -> Set[str]:
             log.error(f"Error getting filenames from {Document.__tablename__} table: {e}")
             log.error(traceback.format_exc())
         
+        # Get filenames from knowledge table
+        try:
+            table_names = inspect(session.get_bind()).get_table_names()
+            if KnowledgeModel.__tablename__ in table_names:
+                # Get all knowledge bases
+                result = session.execute(text(f"SELECT data FROM {KnowledgeModel.__tablename__}"))
+                knowledge_file_ids = set()
+                
+                for row in result:
+                    knowledge_data = row[0]
+                    if knowledge_data and isinstance(knowledge_data, dict):
+                        # Extract file IDs from knowledge base data
+                        file_ids = knowledge_data.get("file_ids", [])
+                        knowledge_file_ids.update(file_ids)
+                
+                # Get filenames for the file IDs
+                if knowledge_file_ids:
+                    try:
+                        # Convert to list for SQL IN clause
+                        file_id_list = list(knowledge_file_ids)
+                        # Process in batches to avoid SQL IN clause limits
+                        batch_size = 100
+                        for i in range(0, len(file_id_list), batch_size):
+                            batch = file_id_list[i:i+batch_size]
+                            # Create a dictionary of parameters
+                            params = {f'id_{j}': id for j, id in enumerate(batch)}
+                            # Create placeholders with named parameters
+                            placeholders = ','.join([f':id_{j}' for j in range(len(batch))])
+                            result = session.execute(
+                                text(f"SELECT filename FROM {File.__tablename__} WHERE id IN ({placeholders})"),
+                                params
+                            )
+                            filenames_in_knowledge = {
+                                normalize_filename(row[0]) for row in result if row[0]
+                            }
+                            referenced_filenames.update(filenames_in_knowledge)
+                        
+                        log.info(f"Found {len(knowledge_file_ids)} file IDs referenced in knowledge bases")
+                    except Exception as e:
+                        log.error(f"Error getting filenames for file IDs in knowledge bases: {e}")
+                        log.error(traceback.format_exc())
+        except Exception as e:
+            log.error(f"Error getting filenames from knowledge table: {e}")
+            log.error(traceback.format_exc())
+        
         # Get filenames from chat messages if chat table exists
         try:
             table_names = inspect(session.get_bind()).get_table_names()
