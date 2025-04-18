@@ -35,6 +35,14 @@ log.addHandler(handler)
 # Define SQLAlchemy models
 Base = declarative_base()
 
+# Configuration variables
+uploads_dir = "/usr/openweb/data/uploads/"
+chroma_dir = "/usr/openweb/data/chroma/"
+
+# Create directories if they don't exist
+os.makedirs(uploads_dir, exist_ok=True)
+os.makedirs(chroma_dir, exist_ok=True)
+
 class Chat(Base):
     __tablename__ = 'chat'  # Changed from 'chats' to 'chat'
     
@@ -340,6 +348,61 @@ def find_old_chats_and_files(days_threshold: int = 45) -> Tuple[List[str], Set[s
         if session:
             session.close()
 
+def delete_file(file_id: str, session, dry_run: bool = True) -> bool:
+    """
+    Delete a file from the database and filesystem.
+    
+    Args:
+        file_id: ID of the file to delete
+        session: Database session
+        dry_run: If True, only log what would be deleted without actually deleting
+        
+    Returns:
+        True if the file was deleted or would be deleted in dry run mode, False otherwise
+    """
+    try:
+        # Get the file from the database
+        file = session.query(File).filter(File.id == file_id).first()
+        if not file:
+            log.warning(f"File {file_id} not found in database, skipping deletion")
+            return True  # Return True to continue processing
+            
+        # Get the file path
+        file_path = os.path.join(uploads_dir, file.filename)
+        
+        # Delete the physical file
+        if not dry_run:
+            if os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                    log.info(f"Deleted file {file_path}")
+                except Exception as e:
+                    log.error(f"Error deleting file {file_path}: {e}")
+                    log.error(traceback.format_exc())
+                    return False
+            else:
+                log.warning(f"File {file_path} does not exist, skipping deletion")
+        
+        # Delete the database record
+        if not dry_run:
+            try:
+                session.delete(file)
+                session.commit()
+                log.info(f"Deleted file record {file_id} from database")
+            except Exception as e:
+                log.error(f"Error deleting file record {file_id} from database: {e}")
+                log.error(traceback.format_exc())
+                session.rollback()
+                return False
+        else:
+            log.info(f"DRY RUN: Would delete file {file_path} and database record {file_id}")
+        
+        return True
+    except Exception as e:
+        log.error(f"Error deleting file {file_id}: {e}")
+        log.error(traceback.format_exc())
+        return False
+
 def delete_chat(session, chat_id: str) -> bool:
     """Delete a chat by ID."""
     try:
@@ -353,37 +416,6 @@ def delete_chat(session, chat_id: str) -> bool:
         return False
     except Exception as e:
         log.error(f"Error deleting chat {chat_id}: {e}")
-        log.error(traceback.format_exc())
-        session.rollback()
-        return False
-
-def delete_file(session, file_id: str, file_path: Optional[str] = None) -> bool:
-    """Delete a file by ID and optionally from storage."""
-    try:
-        file = session.query(File).filter_by(id=file_id).first()
-        if not file:
-            log.warning(f"File {file_id} not found in database, skipping deletion")
-            return True  # Return True to continue processing
-            
-        # Delete from storage if path exists and is provided
-        if file_path and os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-                log.info(f"Deleted file from storage: {file_path}")
-            except Exception as e:
-                log.error(f"Error deleting file from storage {file_id}: {e}")
-                log.error(traceback.format_exc())
-                # Continue with database deletion even if file deletion fails
-        elif file_path:
-            log.warning(f"File path {file_path} does not exist, skipping file deletion")
-        
-        # Delete from database
-        session.delete(file)
-        session.commit()
-        log.info(f"Deleted file record from database: {file_id}")
-        return True
-    except Exception as e:
-        log.error(f"Error deleting file {file_id}: {e}")
         log.error(traceback.format_exc())
         session.rollback()
         return False
@@ -404,26 +436,109 @@ def compact_postgresql(dry_run: bool = False) -> None:
             return
             
         log.info("Running VACUUM ANALYZE on PostgreSQL database...")
-        engine = create_engine(db_url)
-        with engine.connect() as connection:
-            # Check if we have permission to run VACUUM
-            try:
-                connection.execute(text("VACUUM ANALYZE"))
-                connection.commit()
-                log.info("PostgreSQL database compaction completed")
-            except Exception as e:
-                log.error(f"Error running VACUUM ANALYZE: {e}")
-                log.error(traceback.format_exc())
-                log.info("PostgreSQL compaction skipped due to permission issues")
+        
+        # Use direct psycopg2 connection instead of SQLAlchemy for VACUUM
+        import psycopg2
+        from urllib.parse import urlparse
+        
+        # Parse the database URL
+        parsed = urlparse(db_url)
+        dbname = parsed.path[1:]  # Remove leading slash
+        user = parsed.username
+        password = parsed.password
+        host = parsed.hostname
+        port = parsed.port or 5432
+        
+        # Connect directly with psycopg2
+        conn = psycopg2.connect(
+            dbname=dbname,
+            user=user,
+            password=password,
+            host=host,
+            port=port
+        )
+        
+        # Set autocommit to True to avoid transaction block
+        conn.autocommit = True
+        
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("VACUUM ANALYZE")
+            log.info("PostgreSQL database compaction completed")
+        except Exception as e:
+            log.error(f"Error running VACUUM ANALYZE: {e}")
+            log.error(traceback.format_exc())
+            log.info("PostgreSQL compaction skipped due to permission issues")
+        finally:
+            conn.close()
         
     except Exception as e:
         log.error(f"Error compacting PostgreSQL database: {e}")
         log.error(traceback.format_exc())
 
+def compact_chromadb(dry_run: bool = False) -> None:
+    """
+    Compact ChromaDB by running vacuum.
+    
+    Args:
+        dry_run: If True, only show what would be done without actually doing it
+    """
+    try:
+        if dry_run:
+            log.info("DRY RUN: Would run VACUUM on ChromaDB")
+            return
+            
+        log.info("Running VACUUM on ChromaDB...")
+        
+        # Check if ChromaDB is installed
+        try:
+            import chromadb
+            from chromadb.config import Settings
+            
+            # Initialize ChromaDB client
+            client = chromadb.PersistentClient(path=chroma_dir)
+            
+            # Get all collections
+            collections = client.list_collections()
+            
+            if not collections:
+                log.info("No ChromaDB collections found to vacuum")
+                return
+                
+            log.info(f"Found {len(collections)} ChromaDB collections to vacuum")
+            
+            # Vacuum each collection
+            for collection in collections:
+                try:
+                    collection_name = collection.name
+                    log.info(f"Vacuuming ChromaDB collection: {collection_name}")
+                    
+                    # Get collection
+                    coll = client.get_collection(collection_name)
+                    
+                    # Run vacuum
+                    coll.persist()
+                    
+                    log.info(f"Successfully vacuumed ChromaDB collection: {collection_name}")
+                except Exception as e:
+                    log.error(f"Error vacuuming ChromaDB collection {collection_name}: {e}")
+                    log.error(traceback.format_exc())
+            
+            log.info("ChromaDB vacuum completed")
+        except ImportError:
+            log.warning("ChromaDB not installed, skipping ChromaDB vacuum")
+        except Exception as e:
+            log.error(f"Error vacuuming ChromaDB: {e}")
+            log.error(traceback.format_exc())
+            
+    except Exception as e:
+        log.error(f"Error in ChromaDB vacuum process: {e}")
+        log.error(traceback.format_exc())
+
 def cleanup_old_chats(days_threshold: int = 45, dry_run: bool = False) -> None:
     """
     Delete chats and their associated files that are older than the specified number of days.
-    Also compact PostgreSQL database.
+    Also compact PostgreSQL database and ChromaDB.
     
     Args:
         days_threshold: Number of days after which chats should be deleted
@@ -434,8 +549,9 @@ def cleanup_old_chats(days_threshold: int = 45, dry_run: bool = False) -> None:
         old_chat_ids, all_file_ids = find_old_chats_and_files(days_threshold)
         
         if not old_chat_ids and not dry_run:
-            # Even if no chats to delete, we might still want to compact database
+            # Even if no chats to delete, we might still want to compact databases
             compact_postgresql(dry_run)
+            compact_chromadb(dry_run)
             return
             
         if dry_run:
@@ -475,6 +591,7 @@ def cleanup_old_chats(days_threshold: int = 45, dry_run: bool = False) -> None:
             
             # Show database compaction details
             compact_postgresql(dry_run)
+            compact_chromadb(dry_run)
             
             return
         
@@ -495,20 +612,8 @@ def cleanup_old_chats(days_threshold: int = 45, dry_run: bool = False) -> None:
                 
                 for file_id in batch:
                     try:
-                        # Get file record
-                        file = session.query(File).filter_by(id=file_id).first()
-                        if not file:
-                            log.warning(f"File {file_id} not found in database, skipping deletion")
-                            skipped_files += 1
-                            continue
-                            
-                        # Delete from storage if path exists
-                        file_path = None
-                        if file.path:
-                            file_path = file.path
-                        
                         # Delete file
-                        if delete_file(session, file_id, file_path):
+                        if delete_file(file_id, session, dry_run):
                             deleted_files += 1
                     except Exception as e:
                         log.error(f"Error deleting file {file_id}: {e}")
@@ -548,8 +653,9 @@ def cleanup_old_chats(days_threshold: int = 45, dry_run: bool = False) -> None:
             if session:
                 session.close()
         
-        # Compact database after deletion
+        # Compact databases after deletion
         compact_postgresql(dry_run)
+        compact_chromadb(dry_run)
             
     except Exception as e:
         log.error(f"Error during cleanup: {e}")
@@ -562,6 +668,7 @@ def main():
     parser.add_argument('--days', type=int, default=45, help='Number of days after which chats should be deleted (default: 45)')
     parser.add_argument('--dry-run', action='store_true', help='Show what would be deleted without actually deleting')
     parser.add_argument('--db-url', type=str, help='Database URL (e.g., postgresql://user:pass@host:port/db)')
+    parser.add_argument('--chroma-dir', type=str, help='Path to ChromaDB directory')
     args = parser.parse_args()
     
     # Debug information
@@ -588,6 +695,14 @@ def main():
         log.info("Using default PostgreSQL connection: postgresql://postgres:db@127.0.0.1:5432/openweb")
     else:
         log.info("Using DATABASE_URL from environment: %s", os.environ["DATABASE_URL"])
+    
+    # Set ChromaDB directory from command line if provided
+    if args.chroma_dir:
+        global chroma_dir
+        chroma_dir = args.chroma_dir
+        log.info("Using ChromaDB directory from command line: %s", chroma_dir)
+    else:
+        log.info("Using default ChromaDB directory: %s", chroma_dir)
     
     # Try to create a direct connection to PostgreSQL to verify connectivity
     try:
